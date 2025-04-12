@@ -432,16 +432,9 @@ exports.createComment = async (req, res) => {
 
 // Controller to handle adding/updating/removing a reaction on a post
 exports.handleReaction = async (req, res) => {
-  // Log the req.user object as soon as the function starts
-  console.log("\n[Handle Reaction] req.user:", req.user);
-
   const { reactionType } = req.body;
-  const { postId } = req.params;
+  const { postId } = req.params; // Keep postId for clarity in this context
   const authorId = req.user?.userId;
-
-  console.log("[Handle Reaction] Extracted authorId:", authorId); // Log extracted ID
-  // Log the actual boolean value being checked
-  console.log("[Handle Reaction] Boolean check (!authorId):", !authorId);
 
   // --- Input Validation ---
   if (!authorId) {
@@ -451,13 +444,13 @@ exports.handleReaction = async (req, res) => {
     return res.status(400).json({ error: "Post ID is required." });
   }
 
-  // Validate reactionType (must be one of the enum values or null/empty)
-  const validReactionTypes = ["LIKE", "LOVE", "HAHA", "WOW", "SAD", "ANGRY"];
-  const upperReactionType = reactionType
-    ? String(reactionType).toUpperCase()
-    : null;
+  const VALID_REACTION_TYPES = ["LIKE", "LOVE", "HAHA", "WOW", "SAD", "ANGRY"];
+  const upperReactionType =
+    reactionType && typeof reactionType === "string"
+      ? reactionType.toUpperCase()
+      : undefined;
 
-  if (upperReactionType && !validReactionTypes.includes(upperReactionType)) {
+  if (upperReactionType && !VALID_REACTION_TYPES.includes(upperReactionType)) {
     return res.status(400).json({ error: "Invalid reaction type." });
   }
 
@@ -468,75 +461,83 @@ exports.handleReaction = async (req, res) => {
   );
 
   try {
-    // 1. Check if the post exists and get visibility/author info
+    // 1. Check if post exists and get its visibility
     const post = await prisma.post.findUnique({
       where: { id: postId },
-      select: { id: true, visibility: true, authorId: true }, // Fetch visibility and authorId
+      select: { id: true, visibility: true, authorId: true },
     });
+
     if (!post) {
       return res.status(404).json({ error: "Post not found." });
     }
 
-    // 2. Check Visibility/Subscription Permissions
-    if (post.visibility === "SUBSCRIBERS") {
-      // Allow if the reacting user IS the author of the post
-      if (post.authorId !== authorId) {
-        // If not the author, check if the reacting user follows the post author
+    // 2. Check Permissions (Can the user interact with this post?)
+    let canInteract = false;
+    if (post.visibility === "PUBLIC") {
+      canInteract = true;
+    } else if (post.visibility === "SUBSCRIBERS") {
+      if (post.authorId === authorId) {
+        canInteract = true; // Author can always interact
+      } else {
+        // Check if the current user follows the post author
         const postAuthorDetails = await prisma.user.findUnique({
           where: { id: post.authorId },
           select: {
             users_B: {
-              // users_B represents followers
+              // Assuming users_B represents followers
               where: { id: authorId }, // Check if reacting user is in the followers list
               select: { id: true },
             },
           },
         });
-
-        const isFollower = postAuthorDetails?.users_B?.length > 0;
-
-        if (!isFollower) {
-          return res.status(403).json({
-            error: "You must follow the author to react to this post.",
-          });
-        }
+        canInteract = postAuthorDetails?.users_B?.length > 0;
       }
     }
+
+    if (!canInteract) {
+      return res
+        .status(403)
+        .json({ error: "You do not have permission to react to this post." });
+    }
+
+    // --- Polymorphic Setup ---
+    const targetId = postId;
+    const targetType = "Post"; // Explicitly set targetType for posts
+
+    // Define the unique condition for the reaction using the polymorphic key
+    const reactionWhereUniqueInput = {
+      authorId_targetId_targetType: {
+        authorId: authorId,
+        targetId: targetId,
+        targetType: targetType,
+      },
+    };
 
     // 3. Handle Reaction Logic (Upsert or Delete)
     let message = "";
     if (upperReactionType) {
-      // Add or Update reaction
+      // Add or Update reaction using polymorphic fields
       await prisma.reaction.upsert({
-        where: {
-          authorId_postId: {
-            authorId: authorId,
-            postId: postId,
-          },
-        },
+        where: reactionWhereUniqueInput, // Use the polymorphic key
         update: { type: upperReactionType },
         create: {
           type: upperReactionType,
           authorId: authorId,
-          postId: postId,
+          targetId: targetId, // Use targetId
+          targetType: targetType, // Use targetType
         },
       });
       message = "Reaction saved.";
     } else {
-      // Remove reaction (if it exists)
+      // Remove reaction (if it exists) using polymorphic key
       try {
         await prisma.reaction.delete({
-          where: {
-            authorId_postId: {
-              authorId: authorId,
-              postId: postId,
-            },
-          },
+          where: reactionWhereUniqueInput, // Use the polymorphic key
         });
         message = "Reaction removed.";
       } catch (error) {
         if (error.code === "P2025") {
-          // If reaction didn't exist, it's effectively removed, still fetch counts.
+          // If reaction didn't exist, it's effectively removed
           message = "Reaction not found (already removed).";
         } else {
           throw error; // Re-throw other errors
@@ -544,9 +545,13 @@ exports.handleReaction = async (req, res) => {
       }
     }
 
-    // 4. Fetch updated reaction state *after* the operation
-    const updatedReactionCounts = await getReactionCounts(postId);
-    const updatedUserReaction = await getUserReaction(postId, authorId);
+    // 4. Fetch updated reaction state *after* the operation using service functions
+    const updatedReactionCounts = await getReactionCounts(targetId, targetType);
+    const updatedUserReaction = await getUserReaction(
+      authorId,
+      targetId,
+      targetType
+    );
 
     // 5. Send successful response
     res.status(200).json({
@@ -556,10 +561,6 @@ exports.handleReaction = async (req, res) => {
     });
   } catch (error) {
     console.error(`Error handling reaction for post ${postId}:`, error);
-    // Specific error for unique constraint violation (upsert should handle this, but keep for safety)
-    if (error.code === "P2002") {
-      return res.status(409).json({ error: "Reaction conflict occurred." });
-    }
     res.status(500).json({ error: "Failed to process reaction." });
   }
 };
