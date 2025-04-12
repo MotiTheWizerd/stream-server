@@ -1,22 +1,10 @@
 const prisma = require("../db"); // Assuming Prisma client is available via ../db
 const fs = require("fs").promises; // Import fs.promises
 const path = require("path"); // Import path
-
-// Placeholder for file saving logic - replace with actual storage (e.g., S3, Cloudinary)
-const saveMediaFiles = async (files) => {
-  if (!files || files.length === 0) {
-    return [];
-  }
-  console.warn(
-    "Media file saving not implemented. Files were processed by multer but not saved permanently."
-  );
-  // In a real app, upload files to cloud storage here and return their URLs
-  // Example structure:
-  // const uploadPromises = files.map(file => uploadToCloud(file));
-  // const urls = await Promise.all(uploadPromises);
-  // return urls;
-  return files.map((file) => `placeholder_url_for_${file.originalname}`); // Return dummy URLs for now
-};
+const {
+  getReactionCounts,
+  getUserReaction,
+} = require("../services/reactionService");
 
 exports.createPost = async (req, res) => {
   // Extract standard fields and allowComments
@@ -288,8 +276,8 @@ exports.createPost = async (req, res) => {
 
 // Controller to get all posts
 exports.getAllPosts = async (req, res) => {
-  const currentUserId = req.user?.userId; // Get requesting user's ID if authenticated
-  const authorIdFromQuery = req.query.authorId; // Get authorId from query param (Corrected from userId)
+  const currentUserId = req.user?.userId; // Optional user ID
+  const authorIdFromQuery = req.query.authorId; // Optional author filter
 
   console.log(
     `Getting posts, authenticated user: ${currentUserId || "Not authenticated"}`
@@ -302,7 +290,7 @@ exports.getAllPosts = async (req, res) => {
       whereClause.authorId = authorIdFromQuery; // Filter by author if authorId is provided
     }
 
-    // Get posts (filtered or all) with author, comments, and *all* reactions
+    // Get posts (filtered or all) with author and comment count
     const posts = await prisma.post.findMany({
       where: whereClause, // Apply the constructed where clause
       orderBy: {
@@ -316,15 +304,8 @@ exports.getAllPosts = async (req, res) => {
             avatar: true,
           },
         },
-        reactions: {
-          // Include all reactions for counting
-          select: {
-            type: true,
-            authorId: true, // Need authorId to find current user's reaction
-          },
-        },
         _count: {
-          select: { comments: true },
+          select: { comments: true }, // Keep comment count
         },
       },
     });
@@ -334,32 +315,24 @@ exports.getAllPosts = async (req, res) => {
     // Process posts to add reaction counts, user's reaction, and interaction permissions
     const processedPosts = await Promise.all(
       posts.map(async (post) => {
-        // Initialize reactionCounts
-        const reactionCounts = {};
-        let userReaction = null;
-
-        // Calculate reaction counts and find user's reaction
-        for (const reaction of post.reactions) {
-          reactionCounts[reaction.type] =
-            (reactionCounts[reaction.type] || 0) + 1;
-          if (currentUserId && reaction.authorId === currentUserId) {
-            userReaction = reaction.type;
-          }
-        }
+        // Fetch reaction data using the service layer
+        const reactionCounts = await getReactionCounts(post.id, "Post");
+        const userReaction = await getUserReaction(
+          currentUserId,
+          post.id,
+          "Post"
+        );
 
         // Determine if the current user can interact (react/comment) with the post
-        // Always allow public posts to be viewed by everyone, regardless of authentication
         let canInteract = false;
         if (!currentUserId) {
-          // Unauthenticated users can only view posts, not interact
           canInteract = false;
         } else if (post.visibility === "PUBLIC") {
-          canInteract = true; // Authenticated users can interact with public posts
+          canInteract = true;
         } else if (post.visibility === "SUBSCRIBERS" && currentUserId) {
           if (post.authorId === currentUserId) {
-            canInteract = true; // Author can always interact
+            canInteract = true;
           } else {
-            // Check if the current user follows the post author
             const postAuthorDetails = await prisma.user.findUnique({
               where: { id: post.authorId },
               select: {
@@ -373,16 +346,13 @@ exports.getAllPosts = async (req, res) => {
           }
         }
 
-        // Remove the full reactions array from the response
-        const { reactions, ...restOfPost } = post;
-
-        // Return enhanced post data
+        // Return enhanced post data (no need to destructure 'reactions')
         return {
-          ...restOfPost,
-          reactionCounts,
-          userReaction,
-          commentCount: post._count.comments,
-          canInteract,
+          ...post, // Keep all original post fields
+          reactionCounts, // Add fetched counts
+          userReaction, // Add fetched user reaction
+          commentCount: post._count.comments, // Keep comment count
+          canInteract, // Add interaction permission flag
         };
       })
     );
@@ -460,34 +430,6 @@ exports.createComment = async (req, res) => {
   }
 };
 
-// Helper function to get updated reaction counts for a post
-const getReactionCounts = async (postId) => {
-  const reactions = await prisma.reaction.findMany({
-    where: { postId: postId },
-    select: { type: true },
-  });
-  const counts = {};
-  reactions.forEach((r) => {
-    counts[r.type] = (counts[r.type] || 0) + 1;
-  });
-  return counts;
-};
-
-// Helper function to get the current user's reaction to a post
-const getUserReaction = async (postId, userId) => {
-  if (!userId) return null;
-  const reaction = await prisma.reaction.findUnique({
-    where: {
-      authorId_postId: {
-        authorId: userId,
-        postId: postId,
-      },
-    },
-    select: { type: true },
-  });
-  return reaction?.type || null;
-};
-
 // Controller to handle adding/updating/removing a reaction on a post
 exports.handleReaction = async (req, res) => {
   // Log the req.user object as soon as the function starts
@@ -518,6 +460,12 @@ exports.handleReaction = async (req, res) => {
   if (upperReactionType && !validReactionTypes.includes(upperReactionType)) {
     return res.status(400).json({ error: "Invalid reaction type." });
   }
+
+  console.log(
+    `[Handle Reaction] User: ${authorId}, Post: ${postId}, Type: ${
+      upperReactionType || "(removing)"
+    }`
+  );
 
   try {
     // 1. Check if the post exists and get visibility/author info
