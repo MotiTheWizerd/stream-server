@@ -125,7 +125,7 @@ exports.createPost = async (req, res) => {
     if (link && typeof link.url === "string" && typeof link.type === "string") {
       allMediaItems.push({
         source: "link", // Explicitly add source
-        media: link.url, // Use 'media' field for consistency
+        url: link.url, // Use 'url' field for PostMediaItem model
         type: link.type, // Should be 'image', 'video', or 'link'
         title: link.title || null,
       });
@@ -146,7 +146,7 @@ exports.createPost = async (req, res) => {
         authorId: authorId,
         visibility: postVisibility,
         allowComments: allowComments,
-        // mediaUrls will be added/updated later
+        // mediaItems will be created separately
       },
     });
     postId = newPost.id;
@@ -202,7 +202,7 @@ exports.createPost = async (req, res) => {
           // Return object representing the saved upload
           return {
             source: "upload", // Explicitly add source
-            media: relativeUrl, // Use 'media' field for consistency
+            url: relativeUrl, // Use 'url' field for PostMediaItem model
             type: type,
             title: title,
           };
@@ -226,21 +226,20 @@ exports.createPost = async (req, res) => {
     // 3. Combine saved uploaded media with linked media
     allMediaItems.push(...savedUploadedMediaObjects);
 
-    // 4. Update the post with the final combined mediaUrls
+    // 4. Create PostMediaItem records for all collected media
     if (allMediaItems.length > 0) {
-      await prisma.post.update({
-        where: { id: postId }, // Use postId variable
-        data: { mediaUrls: allMediaItems }, // Save the combined array
-      });
-    } else {
-      // If after processing, there are no media items, ensure mediaUrls is an empty array
-      await prisma.post.update({
-        where: { id: postId },
-        data: { mediaUrls: [] },
+      const mediaItemsToCreate = allMediaItems.map((item) => ({
+        ...item,
+        postId: postId, // Link each item to the created post
+      }));
+
+      await prisma.postMediaItem.createMany({
+        data: mediaItemsToCreate,
+        skipDuplicates: true, // Optional: useful if somehow duplicates could occur
       });
     }
 
-    // 5. Fetch the final post data including the updated mediaUrls
+    // 5. Fetch the final post data including the associated mediaItems
     const finalPost = await prisma.post.findUnique({
       where: { id: newPost.id },
       include: {
@@ -251,8 +250,9 @@ exports.createPost = async (req, res) => {
             avatar: true,
           },
         },
-      },
-    });
+        mediaItems: true, // Include the newly created media items
+      }, // End of include block
+    }); // End of findUnique call
 
     // 6. Send response
     res.status(201).json(finalPost);
@@ -307,6 +307,7 @@ exports.getAllPosts = async (req, res) => {
         _count: {
           select: { comments: true }, // Keep comment count
         },
+        mediaItems: true, // Include associated media items
       },
     });
 
@@ -427,140 +428,5 @@ exports.createComment = async (req, res) => {
       return res.status(404).json({ error: "Post or User not found." });
     }
     res.status(500).json({ error: "Failed to create comment." });
-  }
-};
-
-// Controller to handle adding/updating/removing a reaction on a post
-exports.handleReaction = async (req, res) => {
-  const { reactionType } = req.body;
-  const { postId } = req.params; // Keep postId for clarity in this context
-  const authorId = req.user?.userId;
-
-  // --- Input Validation ---
-  if (!authorId) {
-    return res.status(403).json({ error: "User not authenticated." });
-  }
-  if (!postId) {
-    return res.status(400).json({ error: "Post ID is required." });
-  }
-
-  const VALID_REACTION_TYPES = ["LIKE", "LOVE", "HAHA", "WOW", "SAD", "ANGRY"];
-  const upperReactionType =
-    reactionType && typeof reactionType === "string"
-      ? reactionType.toUpperCase()
-      : undefined;
-
-  if (upperReactionType && !VALID_REACTION_TYPES.includes(upperReactionType)) {
-    return res.status(400).json({ error: "Invalid reaction type." });
-  }
-
-  console.log(
-    `[Handle Reaction] User: ${authorId}, Post: ${postId}, Type: ${
-      upperReactionType || "(removing)"
-    }`
-  );
-
-  try {
-    // 1. Check if post exists and get its visibility
-    const post = await prisma.post.findUnique({
-      where: { id: postId },
-      select: { id: true, visibility: true, authorId: true },
-    });
-
-    if (!post) {
-      return res.status(404).json({ error: "Post not found." });
-    }
-
-    // 2. Check Permissions (Can the user interact with this post?)
-    let canInteract = false;
-    if (post.visibility === "PUBLIC") {
-      canInteract = true;
-    } else if (post.visibility === "SUBSCRIBERS") {
-      if (post.authorId === authorId) {
-        canInteract = true; // Author can always interact
-      } else {
-        // Check if the current user follows the post author
-        const postAuthorDetails = await prisma.user.findUnique({
-          where: { id: post.authorId },
-          select: {
-            users_B: {
-              // Assuming users_B represents followers
-              where: { id: authorId }, // Check if reacting user is in the followers list
-              select: { id: true },
-            },
-          },
-        });
-        canInteract = postAuthorDetails?.users_B?.length > 0;
-      }
-    }
-
-    if (!canInteract) {
-      return res
-        .status(403)
-        .json({ error: "You do not have permission to react to this post." });
-    }
-
-    // --- Polymorphic Setup ---
-    const targetId = postId;
-    const targetType = "Post"; // Explicitly set targetType for posts
-
-    // Define the unique condition for the reaction using the polymorphic key
-    const reactionWhereUniqueInput = {
-      authorId_targetId_targetType: {
-        authorId: authorId,
-        targetId: targetId,
-        targetType: targetType,
-      },
-    };
-
-    // 3. Handle Reaction Logic (Upsert or Delete)
-    let message = "";
-    if (upperReactionType) {
-      // Add or Update reaction using polymorphic fields
-      await prisma.reaction.upsert({
-        where: reactionWhereUniqueInput, // Use the polymorphic key
-        update: { type: upperReactionType },
-        create: {
-          type: upperReactionType,
-          authorId: authorId,
-          targetId: targetId, // Use targetId
-          targetType: targetType, // Use targetType
-        },
-      });
-      message = "Reaction saved.";
-    } else {
-      // Remove reaction (if it exists) using polymorphic key
-      try {
-        await prisma.reaction.delete({
-          where: reactionWhereUniqueInput, // Use the polymorphic key
-        });
-        message = "Reaction removed.";
-      } catch (error) {
-        if (error.code === "P2025") {
-          // If reaction didn't exist, it's effectively removed
-          message = "Reaction not found (already removed).";
-        } else {
-          throw error; // Re-throw other errors
-        }
-      }
-    }
-
-    // 4. Fetch updated reaction state *after* the operation using service functions
-    const updatedReactionCounts = await getReactionCounts(targetId, targetType);
-    const updatedUserReaction = await getUserReaction(
-      authorId,
-      targetId,
-      targetType
-    );
-
-    // 5. Send successful response
-    res.status(200).json({
-      message: message,
-      reactionCounts: updatedReactionCounts,
-      userReaction: updatedUserReaction,
-    });
-  } catch (error) {
-    console.error(`Error handling reaction for post ${postId}:`, error);
-    res.status(500).json({ error: "Failed to process reaction." });
   }
 };

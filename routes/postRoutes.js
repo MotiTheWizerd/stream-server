@@ -1,6 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const postController = require("../controllers/postController");
+const reactionController = require("../controllers/reactionController");
 const authenticateToken = require("../middleware/authenticateToken");
 const optionalAuthToken = require("../middleware/optionalAuthToken");
 
@@ -82,7 +83,15 @@ router.post(
 router.post(
   "/:postId/reactions",
   authenticateToken,
-  postController.handleReaction
+  reactionController.handleReaction
+);
+
+// Add new route for media item reactions
+// POST /api/posts/media/:mediaId/reactions - Add/Update/Remove a reaction to a media item
+router.post(
+  "/media/:mediaId/reactions",
+  authenticateToken,
+  reactionController.handleReaction
 );
 
 // Add other post routes here (GET, PUT, DELETE) as needed
