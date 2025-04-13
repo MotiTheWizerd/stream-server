@@ -324,6 +324,29 @@ exports.getAllPosts = async (req, res) => {
           "Post"
         );
 
+        // Process each media item to add reaction data
+        const processedMediaItems = await Promise.all(
+          post.mediaItems.map(async (mediaItem) => {
+            // Fetch reaction data for each media item
+            const mediaReactionCounts = await getReactionCounts(
+              mediaItem.id,
+              "PostMediaItem"
+            );
+            const mediaUserReaction = await getUserReaction(
+              currentUserId,
+              mediaItem.id,
+              "PostMediaItem"
+            );
+
+            // Return enhanced media item
+            return {
+              ...mediaItem,
+              reactionCounts: mediaReactionCounts,
+              userReaction: mediaUserReaction,
+            };
+          })
+        );
+
         // Determine if the current user can interact (react/comment) with the post
         let canInteract = false;
         if (!currentUserId) {
@@ -350,6 +373,7 @@ exports.getAllPosts = async (req, res) => {
         // Return enhanced post data (no need to destructure 'reactions')
         return {
           ...post, // Keep all original post fields
+          mediaItems: processedMediaItems, // Replace with processed media items
           reactionCounts, // Add fetched counts
           userReaction, // Add fetched user reaction
           commentCount: post._count.comments, // Keep comment count
